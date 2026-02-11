@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+"""
+Double Elimination Tournament Manager (doefish)
+Supports 4 and 8 player double elimination, and any other size single elimination
+"""
+
+import json
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+SAVE_DIR = Path.home() / ".tournament_data"
+
+
+class Match:
+    def __init__(self, match_id: int, round_name: str, bracket: str,
+                 p1_seed: int = 0, p2_seed: int = 0, winner_seed: int = 0,
+                 loser_dest: int = 0, winner_dest: int = 0):
+        self.match_id = match_id
+        self.round_name = round_name
+        self.bracket = bracket
+        self.p1_seed = p1_seed
+        self.p2_seed = p2_seed
+        self.winner_seed = winner_seed
+        self.loser_dest = loser_dest
+        self.winner_dest = winner_dest
+        self.status = "pending"  # pending, ready, complete, skipped
+    
+    def to_dict(self) -> Dict:
+        return {
+            "match_id": self.match_id,
+            "round_name": self.round_name,
+            "bracket": self.bracket,
+            "p1_seed": self.p1_seed,
+            "p2_seed": self.p2_seed,
+            "winner_seed": self.winner_seed,
+            "loser_dest": self.loser_dest,
+            "winner_dest": self.winner_dest,
+            "status": self.status
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Match':
+        match = cls(
+            data["match_id"],
+            data["round_name"],
+            data["bracket"],
+            data["p1_seed"],
+            data["p2_seed"],
+            data["winner_seed"],
+            data["loser_dest"],
+            data["winner_dest"]
+        )
+        match.status = data["status"]
+        return match
+
+
+class Tournament:
+    def __init__(self, name: str, players: List[str]):
+        self.name = name
+        self.players = players
+        self.player_count = len(players)
+        self.matches: Dict[int, Match] = {}
+        self.complete = False
+        self.final_standings = []
+        
+        if self.player_count < 3:
+            raise ValueError("Must have at least 3 players")
+        
+        # Use double elimination for power of 2, single elimination otherwise
+        if self.player_count in [4, 8, 16, 32]:
+            if self.player_count == 4:
+                self._init_4player_bracket()
+            elif self.player_count == 8:
+                self._init_8player_bracket()
+            # Can add 16 and 32 later
+        else:
+            self._init_single_elimination()
+    
+    def _init_4player_bracket(self):
+        """Initialize 4-player double elimination bracket"""
+        self.matches = {
+            1: Match(1, "WB-SF1", "winners", 1, 4, loser_dest=3, winner_dest=5),
+            2: Match(2, "WB-SF2", "winners", 2, 3, loser_dest=3, winner_dest=5),
+            3: Match(3, "LB-F", "losers", loser_dest=4, winner_dest=6),
+            4: Match(4, "3rd Place", "placement"),
+            5: Match(5, "WB-F", "winners", loser_dest=4, winner_dest=6),
+            6: Match(6, "GF", "grand", winner_dest=7),
+            7: Match(7, "GF-Reset", "grand-reset")
+        }
+        
+        # Mark initial matches as ready
+        self.matches[1].status = "ready"
+        self.matches[2].status = "ready"
+    
+    def _init_8player_bracket(self):
+        """Initialize 8-player double elimination bracket"""
+        self.matches = {
+            1: Match(1, "WB-QF1", "winners", 1, 8, loser_dest=9, winner_dest=5),
+            2: Match(2, "WB-QF2", "winners", 4, 5, loser_dest=9, winner_dest=5),
+            3: Match(3, "WB-QF3", "winners", 2, 7, loser_dest=10, winner_dest=6),
+            4: Match(4, "WB-QF4", "winners", 3, 6, loser_dest=10, winner_dest=6),
+            5: Match(5, "WB-SF1", "winners", loser_dest=11, winner_dest=14),
+            6: Match(6, "WB-SF2", "winners", loser_dest=12, winner_dest=14),
+            7: Match(7, "LB-R1-1", "losers", winner_dest=11),
+            8: Match(8, "LB-R1-2", "losers", winner_dest=12),
+            9: Match(9, "LB-R2-1", "losers", winner_dest=11),
+            10: Match(10, "LB-R2-2", "losers", winner_dest=12),
+            11: Match(11, "LB-SF1", "losers", winner_dest=15),
+            12: Match(12, "LB-SF2", "losers", winner_dest=15),
+            13: Match(13, "3rd Place", "placement"),
+            14: Match(14, "WB-F", "winners", loser_dest=13, winner_dest=16),
+            15: Match(15, "LB-F", "losers", winner_dest=16),
+            16: Match(16, "GF", "grand", winner_dest=17),
+            17: Match(17, "GF-Reset", "grand-reset")
+        }
+        
+        # Mark initial matches as ready
+        for i in [1, 2, 3, 4]:
+            self.matches[i].status = "ready"
+        
+        # Set up LB-R1 matches (losers from QF play each other)
+        self.matches[7].p1_seed = 0
+        self.matches[7].p2_seed = 0
+        self.matches[7].status = "pending"
+        
+        self.matches[8].p1_seed = 0
+        self.matches[8].p2_seed = 0
+        self.matches[8].status = "pending"
+    
+    def _init_single_elimination(self):
+        """Initialize single elimination bracket for any player count"""
+        n = self.player_count
+        
+        # Calculate total matches needed and byes
+        rounds_needed = math.ceil(math.log2(n))
+        next_power_of_2 = 2 ** rounds_needed
+        first_round_matches = n - (next_power_of_2 // 2)
+        byes = next_power_of_2 - n
+        
+        print(f"Single elimination: {n} players, {first_round_matches} first round matches, {byes} byes")
+        
+        match_id = 1
+        
+        # Distribute seeds - top seeds get byes
+        competing_seeds = []
+        bye_seeds = []
+        
+        for i in range(1, n + 1):
+            if i <= byes:
+                bye_seeds.append(i)
+            else:
+                competing_seeds.append(i)
+        
+        # Create first round matches
+        first_round_winners = []
+        for i in range(first_round_matches):
+            p1 = competing_seeds[i]
+            p2 = competing_seeds[-(i + 1)]
+            
+            self.matches[match_id] = Match(
+                match_id,
+                f"R1-M{i+1}",
+                "single-elim",
+                p1,
+                p2
+            )
+            self.matches[match_id].status = "ready"
+            first_round_winners.append(match_id)
+            match_id += 1
+        
+        # Build subsequent rounds
+        current_round = first_round_winners + bye_seeds
+        current_round_num = 2
+        
+        # Continue building rounds until we have a final
+        while len(current_round) > 1:
+            next_round = []
+            matches_this_round = len(current_round) // 2
+            
+            # Determine round name
+            if matches_this_round == 1:
+                round_name = "Final"
+            elif matches_this_round == 2:
+                round_name = "Semi"
+            elif matches_this_round == 4:
+                round_name = "Quarter"
+            else:
+                round_name = f"R{current_round_num}"
+            
+            for i in range(matches_this_round):
+                slot1 = current_round[i * 2]
+                slot2 = current_round[i * 2 + 1]
+                
+                # Determine if slot is a seed or match ID
+                p1_seed = slot1 if slot1 <= n else 0
+                p2_seed = slot2 if slot2 <= n else 0
+                
+                self.matches[match_id] = Match(
+                    match_id,
+                    f"{round_name}-M{i+1}",
+                    "single-elim",
+                    p1_seed,
+                    p2_seed
+                )
+                
+                # Set status based on whether players are known
+                if p1_seed > 0 and p2_seed > 0:
+                    self.matches[match_id].status = "ready"
+                
+                # Update previous matches to point to this match
+                if slot1 > n and slot1 in self.matches:
+                    self.matches[slot1].winner_dest = match_id
+                if slot2 > n and slot2 in self.matches:
+                    self.matches[slot2].winner_dest = match_id
+                
+                next_round.append(match_id)
+                match_id += 1
+            
+            current_round = next_round
+            current_round_num += 1
+        
+        # Add a 3rd place match if there are semifinals
+        if self.player_count >= 4:
+            semi_matches = [m for m in self.matches.values() if "Semi" in m.round_name]
+            if len(semi_matches) == 2:
+                third_place_match = match_id
+                self.matches[third_place_match] = Match(
+                    third_place_match,
+                    "3rd Place",
+                    "placement"
+                )
+                # Point semifinal losers to 3rd place match
+                for semi in semi_matches:
+                    semi.loser_dest = third_place_match
+    
+    def get_player_name(self, seed: int) -> str:
+        """Get player name from seed number"""
+        if seed > 0 and seed <= len(self.players):
+            return self.players[seed - 1]
+        return "TBD"
+    
+    def show_bracket(self):
+        """Display current tournament bracket"""
+        print(f"\n=== TOURNAMENT: {self.name} ===\n")
+        
+        if self.complete:
+            print("*** TOURNAMENT COMPLETE ***\n")
+            print("Final Standings:")
+            for i, player in enumerate(self.final_standings, 1):
+                print(f"  {i}. {player}")
+            print()
+            return
+        
+        # Check if single elimination
+        is_single_elim = any(m.bracket == "single-elim" for m in self.matches.values())
+        
+        if is_single_elim:
+            print("SINGLE ELIMINATION BRACKET:")
+            print("---------------------------")
+            for match in sorted(self.matches.values(), key=lambda m: m.match_id):
+                if match.bracket == "single-elim":
+                    self._show_match(match)
+            
+            print("\n3RD PLACE:")
+            print("----------")
+            for match in self.matches.values():
+                if match.bracket == "placement":
+                    self._show_match(match)
+            print()
+            return
+        
+        # Original double elimination display
+        print("WINNERS BRACKET:")
+        print("----------------")
+        for match in self.matches.values():
+            if match.bracket == "winners":
+                self._show_match(match)
+        
+        print("\nLOSERS BRACKET:")
+        print("---------------")
+        for match in self.matches.values():
+            if match.bracket == "losers":
+                self._show_match(match)
+        
+        print("\nFINALS:")
+        print("-------")
+        for match in self.matches.values():
+            if match.bracket in ["grand", "grand-reset", "placement"]:
+                self._show_match(match)
+        
+        print()
+    
+    def _show_match(self, match: Match):
+        """Display a single match"""
+        p1_name = self.get_player_name(match.p1_seed)
+        p2_name = self.get_player_name(match.p2_seed)
+        
+        status_str = ""
+        if match.status == "complete":
+            winner_name = self.get_player_name(match.winner_seed)
+            status_str = f"→ WINNER: [{match.winner_seed}] {winner_name}"
+        elif match.status == "ready":
+            status_str = "[READY]"
+        elif match.status == "skipped":
+            status_str = "[SKIPPED]"
+        else:
+            status_str = "[WAITING]"
+        
+        print(f"  Match {match.match_id} [{match.round_name}]: "
+              f"[{match.p1_seed}] {p1_name} vs [{match.p2_seed}] {p2_name} {status_str}")
+    
+    def show_standings(self):
+        """Display current standings with win/loss records"""
+        print(f"\n=== STANDINGS: {self.name} ===\n")
+        
+        # Calculate records for each player
+        records = {}
+        for i, player in enumerate(self.players, 1):
+            records[i] = {"name": player, "wins": 0, "losses": 0, "eliminated": False}
+        
+        # Count wins and losses from completed matches
+        for match in self.matches.values():
+            if match.status == "complete" and match.winner_seed > 0:
+                # Winner gets a win
+                records[match.winner_seed]["wins"] += 1
+                
+                # Loser gets a loss
+                loser_seed = match.p1_seed if match.p1_seed != match.winner_seed else match.p2_seed
+                if loser_seed > 0:
+                    records[loser_seed]["losses"] += 1
+        
+        # Determine who's still active
+        active_seeds = set()
+        for match in self.matches.values():
+            if match.status in ["ready", "pending"]:
+                if match.p1_seed > 0:
+                    active_seeds.add(match.p1_seed)
+                if match.p2_seed > 0:
+                    active_seeds.add(match.p2_seed)
+        
+        # Check if single elimination
+        is_single_elim = any(m.bracket == "single-elim" for m in self.matches.values())
+        
+        # Mark eliminated players
+        for seed, record in records.items():
+            if is_single_elim:
+                # Single elim: 1 loss = eliminated
+                if record["losses"] >= 1 and seed not in active_seeds:
+                    record["eliminated"] = True
+            else:
+                # Double elim: 2 losses = eliminated
+                if record["losses"] >= 2 and seed not in active_seeds:
+                    record["eliminated"] = True
+        
+        # Sort by wins (desc), then losses (asc)
+        sorted_records = sorted(
+            records.items(),
+            key=lambda x: (-x[1]["wins"], x[1]["losses"])
+        )
+        
+        # Display
+        print(f"{'Seed':<6} {'Player':<20} {'W-L':<8} {'Status'}")
+        print("-" * 50)
+        
+        for seed, record in sorted_records:
+            w_l = f"{record['wins']}-{record['losses']}"
+            status = "ELIMINATED" if record["eliminated"] else "Active"
+            
+            if self.complete and self.final_standings:
+                # Show final placement
+                try:
+                    placement = self.final_standings.index(record["name"]) + 1
+                    status = f"#{placement}"
+                except ValueError:
+                    pass
+            
+            print(f"[{seed}]    {record['name']:<20} {w_l:<8} {status}")
+        
+        print()
+    
+    def update_match(self, match_id: int, winner_seed: int):
+        """Update a match with the winner"""
+        if match_id not in self.matches:
+            print(f"Error: Invalid match ID {match_id}")
+            return False
+        
+        match = self.matches[match_id]
+        
+        if match.status == "complete":
+            print(f"Error: Match {match_id} is already complete")
+            return False
+        
+        if match.status != "ready":
+            print(f"Error: Match {match_id} is not ready yet")
+            return False
+        
+        if winner_seed not in [match.p1_seed, match.p2_seed]:
+            print(f"Error: Player {winner_seed} is not in match {match_id}")
+            print(f"  Match {match_id}: [{match.p1_seed}] vs [{match.p2_seed}]")
+            return False
+        
+        # Determine loser
+        loser_seed = match.p2_seed if winner_seed == match.p1_seed else match.p1_seed
+        
+        # Update match
+        match.winner_seed = winner_seed
+        match.status = "complete"
+        
+        print(f"Match {match_id} complete: [{winner_seed}] {self.get_player_name(winner_seed)} "
+              f"defeats [{loser_seed}] {self.get_player_name(loser_seed)}")
+        
+        # Advance winner
+        if match.winner_dest > 0:
+            self._advance_to_match(match.winner_dest, winner_seed)
+        
+        # Advance loser
+        if match.loser_dest > 0:
+            self._advance_to_match(match.loser_dest, loser_seed)
+        
+        # Check for tournament completion
+        self._check_tournament_complete()
+        
+        return True
+    
+    def _advance_to_match(self, dest_match_id: int, player_seed: int):
+        """Advance a player to the next match"""
+        dest = self.matches[dest_match_id]
+        
+        if dest.p1_seed == 0:
+            dest.p1_seed = player_seed
+        elif dest.p2_seed == 0:
+            dest.p2_seed = player_seed
+        else:
+            print(f"Warning: Match {dest_match_id} already has both players")
+            return
+        
+        # Check if match is now ready
+        if dest.p1_seed > 0 and dest.p2_seed > 0:
+            dest.status = "ready"
+            print(f"  → Match {dest_match_id} is now ready: "
+                  f"[{dest.p1_seed}] {self.get_player_name(dest.p1_seed)} vs "
+                  f"[{dest.p2_seed}] {self.get_player_name(dest.p2_seed)}")
+    
+    def _check_tournament_complete(self):
+        """Check if the tournament is complete"""
+        # Check if this is single elimination
+        is_single_elim = any(m.bracket == "single-elim" for m in self.matches.values())
+        
+        if is_single_elim:
+            # Find the final match (highest match ID that's not placement)
+            final_match = max(
+                (m for m in self.matches.values() if m.bracket != "placement"),
+                key=lambda m: m.match_id
+            )
+            
+            if final_match.status == "complete":
+                self.complete = True
+                winner = self.get_player_name(final_match.winner_seed)
+                loser = self.get_player_name(
+                    final_match.p1_seed if final_match.p1_seed != final_match.winner_seed 
+                    else final_match.p2_seed
+                )
+                
+                # Get 3rd place if exists
+                placement_matches = [m for m in self.matches.values() if m.bracket == "placement"]
+                if placement_matches and placement_matches[0].status == "complete":
+                    third = self.get_player_name(placement_matches[0].winner_seed)
+                    fourth = self.get_player_name(
+                        placement_matches[0].p1_seed if placement_matches[0].p1_seed != placement_matches[0].winner_seed
+                        else placement_matches[0].p2_seed
+                    )
+                    self.final_standings = [winner, loser, third, fourth]
+                else:
+                    self.final_standings = [winner, loser]
+            return
+        
+        # Original double elimination logic
+        total_matches = len(self.matches)
+        gf_reset = self.matches[total_matches]
+        gf = self.matches[total_matches - 1]
+        
+        # Check if grand finals reset is complete
+        if gf_reset.status == "complete":
+            self.complete = True
+            winner = self.get_player_name(gf_reset.winner_seed)
+            loser = self.get_player_name(
+                gf_reset.p1_seed if gf_reset.p1_seed != gf_reset.winner_seed else gf_reset.p2_seed
+            )
+            
+            # Get 3rd and 4th place
+            placement_match_id = 4 if self.player_count == 4 else 13
+            placement = self.matches[placement_match_id]
+            third = self.get_player_name(placement.winner_seed)
+            fourth = self.get_player_name(
+                placement.p1_seed if placement.p1_seed != placement.winner_seed else placement.p2_seed
+            )
+            
+            self.final_standings = [winner, loser, third, fourth]
+            return
+        
+        # Check if grand finals is complete
+        if gf.status == "complete":
+            # Find winners bracket final to determine if reset is needed
+            wb_final_id = 5 if self.player_count == 4 else 14
+            wb_final = self.matches[wb_final_id]
+            wb_winner = wb_final.winner_seed
+            
+            # If loser's bracket player won, need reset
+            if gf.winner_seed != wb_winner:
+                gf_reset.p1_seed = gf.winner_seed
+                gf_reset.p2_seed = wb_winner
+                gf_reset.status = "ready"
+                print(f"  → Grand Finals Reset required! Match {total_matches} is ready")
+            else:
+                # Winners bracket player won, tournament complete
+                self.complete = True
+                winner = self.get_player_name(gf.winner_seed)
+                loser = self.get_player_name(
+                    gf.p1_seed if gf.p1_seed != gf.winner_seed else gf.p2_seed
+                )
+                
+                # Get 3rd and 4th place
+                placement_match_id = 4 if self.player_count == 4 else 13
+                placement = self.matches[placement_match_id]
+                third = self.get_player_name(placement.winner_seed)
+                fourth = self.get_player_name(
+                    placement.p1_seed if placement.p1_seed != placement.winner_seed else placement.p2_seed
+                )
+                
+                self.final_standings = [winner, loser, third, fourth]
+    
+    def to_dict(self) -> Dict:
+        """Serialize tournament to dictionary"""
+        return {
+            "name": self.name,
+            "players": self.players,
+            "player_count": self.player_count,
+            "matches": {k: v.to_dict() for k, v in self.matches.items()},
+            "complete": self.complete,
+            "final_standings": self.final_standings
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Tournament':
+        """Deserialize tournament from dictionary"""
+        # Create a new tournament instance without calling __init__
+        tournament = cls.__new__(cls)
+        tournament.name = data["name"]
+        tournament.players = data["players"]
+        tournament.player_count = data["player_count"]
+        tournament.complete = data["complete"]
+        tournament.final_standings = data["final_standings"]
+        
+        # Restore matches
+        tournament.matches = {}
+        for match_id_str, match_data in data["matches"].items():
+            match_id = int(match_id_str)
+            tournament.matches[match_id] = Match.from_dict(match_data)
+        
+        return tournament
+
+
+def sanitize_name(name: str) -> str:
+    """Convert tournament name to safe filename"""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+def get_save_path(name: str) -> Path:
+    """Get the save path for a tournament"""
+    safe_name = sanitize_name(name)
+    return SAVE_DIR / f"{safe_name}.json"
+
+
+def ensure_save_dir():
+    """Ensure the save directory exists"""
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_tournament(tournament: Tournament):
+    """Save tournament to disk"""
+    ensure_save_dir()
+    save_path = get_save_path(tournament.name)
+    
+    with open(save_path, 'w') as f:
+        json.dump(tournament.to_dict(), f, indent=2)
+    
+    print(f"Tournament saved to {save_path}")
+
+
+def load_tournament(name: str) -> Optional[Tournament]:
+    """Load tournament from disk"""
+    save_path = get_save_path(name)
+    
+    if not save_path.exists():
+        print(f"Error: Tournament '{name}' not found")
+        return None
+    
+    with open(save_path, 'r') as f:
+        data = json.load(f)
+    
+    tournament = Tournament.from_dict(data)
+    print(f"Tournament '{name}' loaded")
+    return tournament
+
+
+def list_tournaments():
+    """List all available tournaments"""
+    ensure_save_dir()
+    
+    print("Available tournaments:")
+    print()
+    
+    tournaments = list(SAVE_DIR.glob("*.json"))
+    
+    if not tournaments:
+        print("  No tournaments found")
+        return
+    
+    for path in sorted(tournaments):
+        name = path.stem.replace("_", " ")
+        modified = path.stat().st_mtime
+        from datetime import datetime
+        mod_str = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M")
+        print(f"  - {name} (modified: {mod_str})")
+
+
+def delete_tournament(name: str):
+    """Delete a tournament"""
+    save_path = get_save_path(name)
+    
+    if not save_path.exists():
+        print(f"Error: Tournament '{name}' not found")
+        return
+    
+    save_path.unlink()
+    print(f"Tournament '{name}' deleted")
+
+
+def show_help():
+    """Show help message"""
+    print("Double Elimination Tournament Manager (doefish)")
+    print()
+    print("Usage:")
+    print("  doefish --new <name> --players <p1,p2,p3,p4[,p5,p6,p7,p8,...]>")
+    print("  doefish --show <name>")
+    print("  doefish --standings <name>")
+    print("  doefish --update <name> --match <num> --winner <player_num>")
+    print("  doefish --list")
+    print("  doefish --delete <name>")
+    print()
+    print("Examples:")
+    print('  doefish --new "Rose Lunch Feb" --players "nabil,richard,tyler,micah"')
+    print('  doefish --show "Rose Lunch Feb"')
+    print('  doefish --standings "Rose Lunch Feb"')
+    print('  doefish --update "Rose Lunch Feb" --match 1 --winner 1')
+    print()
+    print("Tournament types:")
+    print("  - 4 or 8 players: Double elimination")
+    print("  - Other counts: Single elimination")
+    print()
+    print(f"Tournament data stored in: {SAVE_DIR}")
+
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) < 2:
+        show_help()
+        return
+    
+    args = sys.argv[1:]
+    cmd = None
+    tournament_name = None
+    player_list = None
+    match_num = None
+    winner_num = None
+    
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        
+        if arg in ["-h", "--help"]:
+            show_help()
+            return
+        elif arg == "--new":
+            cmd = "new"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--players":
+            i += 1
+            player_list = args[i]
+        elif arg == "--show":
+            cmd = "show"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--standings":
+            cmd = "standings"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--update":
+            cmd = "update"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--match":
+            i += 1
+            match_num = int(args[i])
+        elif arg == "--winner":
+            i += 1
+            winner_num = int(args[i])
+        elif arg == "--list":
+            cmd = "list"
+        elif arg == "--delete":
+            cmd = "delete"
+            i += 1
+            tournament_name = args[i]
+        
+        i += 1
+    
+    # Execute command
+    if cmd == "new":
+        if not tournament_name or not player_list:
+            print("Error: --new requires --players")
+            show_help()
+            return
+        
+        players = [p.strip() for p in player_list.split(",")]
+        
+        try:
+            tournament = Tournament(tournament_name, players)
+            save_tournament(tournament)
+            tournament.show_bracket()
+        except ValueError as e:
+            print(f"Error: {e}")
+    
+    elif cmd == "show":
+        if not tournament_name:
+            print("Error: --show requires tournament name")
+            return
+        
+        tournament = load_tournament(tournament_name)
+        if tournament:
+            tournament.show_bracket()
+    
+    elif cmd == "standings":
+        if not tournament_name:
+            print("Error: --standings requires tournament name")
+            return
+        
+        tournament = load_tournament(tournament_name)
+        if tournament:
+            tournament.show_standings()
+    
+    elif cmd == "update":
+        if not tournament_name or match_num is None or winner_num is None:
+            print("Error: --update requires tournament name, --match and --winner")
+            return
+        
+        tournament = load_tournament(tournament_name)
+        if tournament:
+            if tournament.update_match(match_num, winner_num):
+                save_tournament(tournament)
+                tournament.show_bracket()
+    
+    elif cmd == "list":
+        list_tournaments()
+    
+    elif cmd == "delete":
+        if not tournament_name:
+            print("Error: --delete requires tournament name")
+            return
+        
+        delete_tournament(tournament_name)
+    
+    else:
+        show_help()
+
+
+if __name__ == "__main__":
+    main()

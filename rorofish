@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+Round Robin Tournament Manager (rorofish)
+Supports single and double round robin for any number of players
+Tracks wins, losses, and draws only (no scores)
+"""
+
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+SAVE_DIR = Path.home() / ".tournament_data"
+
+
+class Match:
+    def __init__(self, match_id: int, round_num: int, p1_seed: int, p2_seed: int):
+        self.match_id = match_id
+        self.round_num = round_num
+        self.p1_seed = p1_seed
+        self.p2_seed = p2_seed
+        self.winner_seed = 0  # 0 = not played, -1 = draw
+        self.status = "pending"  # pending, complete
+    
+    def to_dict(self) -> Dict:
+        return {
+            "match_id": self.match_id,
+            "round_num": self.round_num,
+            "p1_seed": self.p1_seed,
+            "p2_seed": self.p2_seed,
+            "winner_seed": self.winner_seed,
+            "status": self.status
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Match':
+        match = cls(
+            data["match_id"],
+            data["round_num"],
+            data["p1_seed"],
+            data["p2_seed"]
+        )
+        match.winner_seed = data["winner_seed"]
+        match.status = data["status"]
+        return match
+
+
+class Tournament:
+    def __init__(self, name: str, players: List[str], double_rr: bool = False):
+        self.name = name
+        self.players = players
+        self.player_count = len(players)
+        self.double_rr = double_rr
+        self.matches: Dict[int, Match] = {}
+        self.complete = False
+        
+        if self.player_count < 2:
+            raise ValueError("Must have at least 2 players")
+        
+        self._generate_round_robin()
+    
+    def _generate_round_robin(self):
+        """Generate round robin pairings"""
+        match_id = 1
+        n = self.player_count
+        
+        # Generate all pairings
+        pairings = []
+        for i in range(1, n + 1):
+            for j in range(i + 1, n + 1):
+                pairings.append((i, j))
+        
+        # Single round robin
+        for round_num, (p1, p2) in enumerate(pairings, 1):
+            self.matches[match_id] = Match(match_id, round_num, p1, p2)
+            match_id += 1
+        
+        # Double round robin - add reverse fixtures
+        if self.double_rr:
+            start_round = len(pairings) + 1
+            for round_num, (p1, p2) in enumerate(pairings, start_round):
+                self.matches[match_id] = Match(match_id, round_num, p2, p1)
+                match_id += 1
+    
+    def get_player_name(self, seed: int) -> str:
+        """Get player name from seed number"""
+        if seed > 0 and seed <= len(self.players):
+            return self.players[seed - 1]
+        return "Unknown"
+    
+    def show_bracket(self):
+        """Display all matches"""
+        rr_type = "DOUBLE" if self.double_rr else "SINGLE"
+        print(f"\n=== {rr_type} ROUND ROBIN: {self.name} ===\n")
+        
+        if self.complete:
+            print("*** TOURNAMENT COMPLETE ***\n")
+            self.show_standings()
+            return
+        
+        # Group matches by status
+        pending = []
+        complete = []
+        
+        for match in sorted(self.matches.values(), key=lambda m: m.match_id):
+            if match.status == "complete":
+                complete.append(match)
+            else:
+                pending.append(match)
+        
+        if pending:
+            print("PENDING MATCHES:")
+            print("----------------")
+            for match in pending:
+                self._show_match(match)
+            print()
+        
+        if complete:
+            print("COMPLETED MATCHES:")
+            print("------------------")
+            for match in complete:
+                self._show_match(match)
+            print()
+    
+    def _show_match(self, match: Match):
+        """Display a single match"""
+        p1_name = self.get_player_name(match.p1_seed)
+        p2_name = self.get_player_name(match.p2_seed)
+        
+        if match.status == "complete":
+            if match.winner_seed == -1:
+                result = "DRAW"
+            else:
+                winner_name = self.get_player_name(match.winner_seed)
+                result = f"WINNER: [{match.winner_seed}] {winner_name}"
+            print(f"  Match {match.match_id}: [{match.p1_seed}] {p1_name} vs [{match.p2_seed}] {p2_name} → {result}")
+        else:
+            print(f"  Match {match.match_id}: [{match.p1_seed}] {p1_name} vs [{match.p2_seed}] {p2_name} [PENDING]")
+    
+    def show_standings(self):
+        """Display current standings"""
+        print(f"\n=== STANDINGS: {self.name} ===\n")
+        
+        # Calculate records for each player
+        records = {}
+        for i, player in enumerate(self.players, 1):
+            records[i] = {
+                "name": player,
+                "played": 0,
+                "wins": 0,
+                "draws": 0,
+                "losses": 0,
+                "points": 0
+            }
+        
+        # Count results from completed matches
+        for match in self.matches.values():
+            if match.status == "complete":
+                records[match.p1_seed]["played"] += 1
+                records[match.p2_seed]["played"] += 1
+                
+                if match.winner_seed == -1:
+                    # Draw
+                    records[match.p1_seed]["draws"] += 1
+                    records[match.p2_seed]["draws"] += 1
+                    records[match.p1_seed]["points"] += 1
+                    records[match.p2_seed]["points"] += 1
+                elif match.winner_seed == match.p1_seed:
+                    records[match.p1_seed]["wins"] += 1
+                    records[match.p1_seed]["points"] += 3
+                    records[match.p2_seed]["losses"] += 1
+                else:
+                    records[match.p2_seed]["wins"] += 1
+                    records[match.p2_seed]["points"] += 3
+                    records[match.p1_seed]["losses"] += 1
+        
+        # Sort by points (desc), then wins (desc), then losses (asc)
+        sorted_records = sorted(
+            records.items(),
+            key=lambda x: (
+                -x[1]["points"],
+                -x[1]["wins"],
+                x[1]["losses"]
+            )
+        )
+        
+        # Display
+        print(f"{'Pos':<4} {'Player':<20} {'P':<4} {'W':<4} {'D':<4} {'L':<4} {'Pts'}")
+        print("-" * 60)
+        
+        for pos, (seed, record) in enumerate(sorted_records, 1):
+            print(f"{pos:<4} {record['name']:<20} {record['played']:<4} {record['wins']:<4} "
+                  f"{record['draws']:<4} {record['losses']:<4} {record['points']}")
+        
+        print()
+        print("Legend: P=Played, W=Wins, D=Draws, L=Losses, Pts=Points (Win=3, Draw=1, Loss=0)")
+        print()
+    
+    def update_match(self, match_id: int, winner_seed: int):
+        """Update a match with winner"""
+        if match_id not in self.matches:
+            print(f"Error: Invalid match ID {match_id}")
+            return False
+        
+        match = self.matches[match_id]
+        
+        if match.status == "complete":
+            print(f"Error: Match {match_id} is already complete")
+            return False
+        
+        # -1 for draw, or valid player seed
+        if winner_seed != -1 and winner_seed not in [match.p1_seed, match.p2_seed]:
+            print(f"Error: Player {winner_seed} is not in match {match_id}")
+            print(f"  Match {match_id}: [{match.p1_seed}] vs [{match.p2_seed}]")
+            print(f"  Use -1 for a draw")
+            return False
+        
+        # Update match
+        match.winner_seed = winner_seed
+        match.status = "complete"
+        
+        p1_name = self.get_player_name(match.p1_seed)
+        p2_name = self.get_player_name(match.p2_seed)
+        
+        if winner_seed == -1:
+            print(f"Match {match_id}: [{match.p1_seed}] {p1_name} vs [{match.p2_seed}] {p2_name} (DRAW)")
+        else:
+            winner_name = self.get_player_name(winner_seed)
+            loser_seed = match.p1_seed if winner_seed == match.p2_seed else match.p2_seed
+            loser_name = self.get_player_name(loser_seed)
+            print(f"Match {match_id}: [{winner_seed}] {winner_name} defeats [{loser_seed}] {loser_name}")
+        
+        # Check if tournament is complete
+        self._check_tournament_complete()
+        
+        return True
+    
+    def _check_tournament_complete(self):
+        """Check if all matches are complete"""
+        all_complete = all(m.status == "complete" for m in self.matches.values())
+        if all_complete:
+            self.complete = True
+            print("\n*** All matches complete! Tournament finished! ***")
+    
+    def to_dict(self) -> Dict:
+        """Serialize tournament to dictionary"""
+        return {
+            "name": self.name,
+            "players": self.players,
+            "player_count": self.player_count,
+            "double_rr": self.double_rr,
+            "matches": {k: v.to_dict() for k, v in self.matches.items()},
+            "complete": self.complete
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Tournament':
+        """Deserialize tournament from dictionary"""
+        tournament = cls.__new__(cls)
+        tournament.name = data["name"]
+        tournament.players = data["players"]
+        tournament.player_count = data["player_count"]
+        tournament.double_rr = data["double_rr"]
+        tournament.complete = data["complete"]
+        
+        # Restore matches
+        tournament.matches = {}
+        for match_id_str, match_data in data["matches"].items():
+            match_id = int(match_id_str)
+            tournament.matches[match_id] = Match.from_dict(match_data)
+        
+        return tournament
+
+
+def sanitize_name(name: str) -> str:
+    """Convert tournament name to safe filename"""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+def get_save_path(name: str) -> Path:
+    """Get the save path for a tournament"""
+    safe_name = sanitize_name(name)
+    return SAVE_DIR / f"rr_{safe_name}.json"
+
+
+def ensure_save_dir():
+    """Ensure the save directory exists"""
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_tournament(tournament: Tournament):
+    """Save tournament to disk"""
+    ensure_save_dir()
+    save_path = get_save_path(tournament.name)
+    
+    with open(save_path, 'w') as f:
+        json.dump(tournament.to_dict(), f, indent=2)
+    
+    print(f"Tournament saved to {save_path}")
+
+
+def load_tournament(name: str) -> Optional[Tournament]:
+    """Load tournament from disk"""
+    save_path = get_save_path(name)
+    
+    if not save_path.exists():
+        print(f"Error: Tournament '{name}' not found")
+        return None
+    
+    with open(save_path, 'r') as f:
+        data = json.load(f)
+    
+    tournament = Tournament.from_dict(data)
+    print(f"Tournament '{name}' loaded")
+    return tournament
+
+
+def list_tournaments():
+    """List all available tournaments"""
+    ensure_save_dir()
+    
+    print("Available round robin tournaments:")
+    print()
+    
+    tournaments = list(SAVE_DIR.glob("rr_*.json"))
+    
+    if not tournaments:
+        print("  No tournaments found")
+        return
+    
+    for path in sorted(tournaments):
+        name = path.stem.replace("rr_", "").replace("_", " ")
+        modified = path.stat().st_mtime
+        from datetime import datetime
+        mod_str = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M")
+        print(f"  - {name} (modified: {mod_str})")
+
+
+def delete_tournament(name: str):
+    """Delete a tournament"""
+    save_path = get_save_path(name)
+    
+    if not save_path.exists():
+        print(f"Error: Tournament '{name}' not found")
+        return
+    
+    save_path.unlink()
+    print(f"Tournament '{name}' deleted")
+
+
+def end_tournament(name: str):
+    """Manually mark a tournament as complete"""
+    tournament = load_tournament(name)
+    if not tournament:
+        return
+    
+    if tournament.complete:
+        print(f"Tournament '{name}' is already complete")
+        return
+    
+    # Ask for confirmation
+    print(f"\nAre you sure you want to end '{name}'?")
+    print("This will mark it as complete without completing all matches.")
+    response = input("Type 'yes' to confirm: ")
+    
+    if response.lower() != 'yes':
+        print("Cancelled")
+        return
+    
+    tournament.complete = True
+    save_tournament(tournament)
+    print(f"Tournament '{name}' has been ended")
+
+
+def show_help():
+    """Show help message"""
+    print("Round Robin Tournament Manager (rorofish)")
+    print()
+    print("Usage:")
+    print("  rorofish --new <name> --players <p1,p2,p3,...> [--double]")
+    print("  rorofish --show <name>")
+    print("  rorofish --standings <name>")
+    print("  rorofish --update <name> --match <num> --winner <player_num|-1>")
+    print("  rorofish --end <name>")
+    print("  rorofish --list")
+    print("  rorofish --delete <name>")
+    print()
+    print("Examples:")
+    print('  rorofish --new "Spring League" --players "alice,bob,charlie,diana"')
+    print('  rorofish --new "Fall League" --players "p1,p2,p3,p4" --double')
+    print('  rorofish --show "Spring League"')
+    print('  rorofish --standings "Spring League"')
+    print('  rorofish --update "Spring League" --match 1 --winner 1')
+    print('  rorofish --update "Spring League" --match 2 --winner -1  # Draw')
+    print('  rorofish --end "Spring League"')
+    print()
+    print("Tournament types:")
+    print("  - Default: Single round robin (each pair plays once)")
+    print("  - --double: Double round robin (each pair plays twice)")
+    print()
+    print("Scoring:")
+    print("  - Win: 3 points")
+    print("  - Draw: 1 point (use --winner -1)")
+    print("  - Loss: 0 points")
+    print("  - Tiebreakers: Points → Wins → Losses")
+    print()
+    print(f"Tournament data stored in: {SAVE_DIR}")
+
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) < 2:
+        show_help()
+        return
+    
+    args = sys.argv[1:]
+    cmd = None
+    tournament_name = None
+    player_list = None
+    match_num = None
+    winner_num = None
+    double_rr = False
+    
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        
+        if arg in ["-h", "--help"]:
+            show_help()
+            return
+        elif arg == "--new":
+            cmd = "new"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--players":
+            i += 1
+            player_list = args[i]
+        elif arg == "--double":
+            double_rr = True
+        elif arg == "--show":
+            cmd = "show"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--standings":
+            cmd = "standings"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--update":
+            cmd = "update"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--match":
+            i += 1
+            match_num = int(args[i])
+        elif arg == "--winner":
+            i += 1
+            winner_num = int(args[i])
+        elif arg == "--list":
+            cmd = "list"
+        elif arg == "--delete":
+            cmd = "delete"
+            i += 1
+            tournament_name = args[i]
+        elif arg == "--end":
+            cmd = "end"
+            i += 1
+            tournament_name = args[i]
+        
+        i += 1
+    
+    # Execute command
+    if cmd == "new":
+        if not tournament_name or not player_list:
+            print("Error: --new requires --players")
+            show_help()
+            return
+        
+        players = [p.strip() for p in player_list.split(",")]
+        
+        try:
+            tournament = Tournament(tournament_name, players, double_rr)
+            save_tournament(tournament)
+            tournament.show_bracket()
+        except ValueError as e:
+            print(f"Error: {e}")
+    
+    elif cmd == "show":
+        if not tournament_name:
+            print("Error: --show requires tournament name")
+            return
+        
+        tournament = load_tournament(tournament_name)
+        if tournament:
+            tournament.show_bracket()
+    
+    elif cmd == "standings":
+        if not tournament_name:
+            print("Error: --standings requires tournament name")
+            return
+        
+        tournament = load_tournament(tournament_name)
+        if tournament:
+            tournament.show_standings()
+    
+    elif cmd == "update":
+        if not tournament_name or match_num is None or winner_num is None:
+            print("Error: --update requires <name> --match <num> --winner <player_num|-1>")
+            return
+        
+        tournament = load_tournament(tournament_name)
+        if tournament:
+            if tournament.update_match(match_num, winner_num):
+                save_tournament(tournament)
+                tournament.show_standings()
+    
+    elif cmd == "list":
+        list_tournaments()
+    
+    elif cmd == "delete":
+        if not tournament_name:
+            print("Error: --delete requires tournament name")
+            return
+        
+        delete_tournament(tournament_name)
+    
+    elif cmd == "end":
+        if not tournament_name:
+            print("Error: --end requires tournament name")
+            return
+        
+        end_tournament(tournament_name)
+    
+    else:
+        show_help()
+
+
+if __name__ == "__main__":
+    main()
